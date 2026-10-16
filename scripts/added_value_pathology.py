@@ -97,9 +97,49 @@ def main():
         print(f"{'candidate (per SD / binary), adjusted for clinical GG':52s} {'OR (95% CI)':20s} {'LR p':>9s} {'BH':>8s}  dAUC corrected (95% CI apparent)")
         for k, r in sorted(out["tests"].items(), key=lambda kv: kv[1]["lr_p"]):
             print(f"{k:52s} {r['odds_ratio'][0]:5.2f} ({r['odds_ratio'][1]:.2f}-{r['odds_ratio'][2]:.2f})   {r['lr_p']:9.2g} {r['lr_p_bh']:8.2g}  {r['auc_gain_corrected']:+.3f} ({r['auc_gain_ci'][0]:+.3f} to {r['auc_gain_ci'][1]:+.3f})")
+    res["robustness"] = robustness(outcomes)
+    print("\nrobustness:", json.dumps(res["robustness"], indent=1))
     from common import RESULTS
     os.makedirs(RESULTS, exist_ok=True)
     json.dump(res, open(os.path.join(RESULTS, "added_value_pathology.json"), "w"), indent=1)
+
+
+
+def robustness(outcomes):
+    """Sensitivity checks for the area-ranked AI grade added to the clinical grade group:
+    clinical grade entered as categories, pT stage added (nodal outcome only; pT is the other
+    outcome), single-slide patients only, the reverse test (clinical grade added to the AI
+    grade), and outcome counts by AI grade group."""
+    import pandas as pd
+    out = {}
+    for oname, (d, ycol) in outcomes.items():
+        d = d.reset_index(drop=True)
+        y = d[ycol].astype(int).values
+        ai = d[["ai_gg_area"]].astype(float).values
+        clin = d[["clin_gg"]].astype(float).values
+
+        def added(base):
+            m0, m1 = logit(y, base), logit(y, np.column_stack([base, ai]))
+            ci = np.exp([m1.beta - 1.96 * m1.se, m1.beta + 1.96 * m1.se])
+            return dict(odds_ratio=[float(np.exp(m1.beta)), float(ci[0]), float(ci[1])],
+                        lr_p=float(chi2.sf(2 * (m1.llf - m0.llf), 1)))
+        r = {"categorical_clinical_gg": added(pd.get_dummies(d["clin_gg"].astype(int), drop_first=True).astype(float).values)}
+        if ycol == "n1":
+            pt = d["pt_stage_num"].fillna(2).astype(float).values
+            r["adjusted_for_pT"] = added(np.column_stack([clin, pt]))
+        single = (d["n_slides"] == 1).values
+        ys, cs, as_ = y[single], clin[single], ai[single]
+        m0, m1 = logit(ys, cs), logit(ys, np.column_stack([cs, as_]))
+        ci = np.exp([m1.beta - 1.96 * m1.se, m1.beta + 1.96 * m1.se])
+        r["single_slide"] = dict(n=int(single.sum()), events=int(ys.sum()),
+                                 odds_ratio=[float(np.exp(m1.beta)), float(ci[0]), float(ci[1])],
+                                 lr_p=float(chi2.sf(2 * (m1.llf - m0.llf), 1)))
+        m_ai, m_both = logit(y, ai), logit(y, np.column_stack([ai, clin]))
+        r["clinical_added_to_ai_lr_p"] = float(chi2.sf(2 * (m_both.llf - m_ai.llf), 1))
+        r["events_by_ai_gg"] = {int(g): [int(y[d["ai_gg_area"] == g].sum()), int((d["ai_gg_area"] == g).sum())]
+                                for g in sorted(d["ai_gg_area"].dropna().unique())}
+        out[oname] = r
+    return out
 
 
 if __name__ == "__main__":
